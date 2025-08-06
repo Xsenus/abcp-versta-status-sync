@@ -3,14 +3,14 @@ import json
 import sys
 import logging
 from datetime import datetime, timedelta
-import calendar
 from dotenv import load_dotenv
 import os
 import time
+from dateutil.parser import parse
 
 # === Логирование ===
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
@@ -32,51 +32,106 @@ HEADERS_VERSTA = {
     "Accept": "application/json"
 }
 
+EXCLUDED_STATUSES = {610}   # Список статусов, которые не учитываем при анализе
+
+# Четкая таблица соответствий Versta → ABCP (только точные пары master+sub)
 VERSTA_TO_ABCP = {
     # === Доставляется ===
-    (100, 6):  {"id": 405204, "name": "Доставляется"},
-    (100, 7):  {"id": 405204, "name": "Доставляется"},
-    (100, 8):  {"id": 405204, "name": "Доставляется"},
-    (100, 9):  {"id": 405204, "name": "Доставляется"},
-    (100, 10): {"id": 405204, "name": "Доставляется"},
-    (100, 11): {"id": 405204, "name": "Доставляется"},
-    (100, None): {"id": 405204, "name": "Доставляется"},
+    (100, 6):  {"id": 405204, "name": "Доставляется"},  # CourierAssigned
+    (100, 7):  {"id": 405204, "name": "Доставляется"},  # ParcelPickedUp
+    (100, 8):  {"id": 405204, "name": "Доставляется"},  # CourierOnTheWay
+    (100, 9):  {"id": 405204, "name": "Доставляется"},  # ParcelOnTheWay
+    (100, 10): {"id": 405204, "name": "Доставляется"},  # ParcelInTheRecipientCity
+    (100, 11): {"id": 405204, "name": "Доставляется"},  # ParcelHandedForDelivery
 
     # === Доставлен ===
-    (200, 12): {"id": 405205, "name": "Доставлен"},
-    (200, None): {"id": 405205, "name": "Доставлен"},
+    (200, 12): {"id": 405205, "name": "Доставлен"},      # ParcelInPickupPoint
 
     # === Получен ===
-    (700, 90): {"id": 385106, "name": "Получен"},
-    (700, None): {"id": 385106, "name": "Получен"},
+    (700, 90): {"id": 385106, "name": "Получен"},        # Finished
 
     # === Возвращается ===
-    (800, 95): {"id": 385107, "name": "Возвращается"},
-    (800, None): {"id": 385107, "name": "Возвращается"},
-
-    # === Проблема доставки ===
-    ("ProblemDetected", None): {"id": 409382, "name": "Проблема доставки"},
-
-    # === Отменен поставщиком ===
-    ("Returning", None): {"id": 384501, "name": "Отменен поставщиком"},
-
-    # === Отменен по неоплате ===
-    (600, None): {"id": 404714, "name": "Отменен по неоплате"},
-    ("Cancelled", None): {"id": 404714, "name": "Отменен по неоплате"},
-
-    # === Вернулся в ТК ===
-    (60, None): {"id": 418655, "name": "Вернулся в ТК"},
-    ("NotDelivered", None): {"id": 418655, "name": "Вернулся в ТК"},
-
-    # === Возврат принят ===
-    ("ReturnAccepted", None): {"id": 418656, "name": "Возврат принят"},
-
-    # === Новый заказ ===
-    (0, None): {"id": 409381, "name": "Новый"},
-
-    # === Готов к выдаче (предположение для 300) ===
-    (300, None): {"id": 405204, "name": "Доставляется"},
+    (800, 95): {"id": 385107, "name": "Возвращается"},   # RefuseOfDelivery
 }
+
+# Будущие fallback-правила можно держать отдельно и подключать по необходимости
+FALLBACK_VERSTA_TO_ABCP = {
+    # (100, None): {"id": 405204, "name": "Доставляется"},  # Transportation (резерв)
+    # (200, None): {"id": 405205, "name": "Доставлен"},     # Delivery (резерв)
+}
+
+def log_mapping_table():
+    """Выводит таблицу соответствий Versta → ABCP для заказчика."""
+    log.info("\n📋 Таблица соответствий статусов Versta → ABCP:")
+    for (master, sub), abcp in VERSTA_TO_ABCP.items():
+        log.info(f"  Versta: master={master}, sub={sub} → ABCP: {abcp['name']} (ID {abcp['id']})")
+
+def map_status(master_status, sub_status):
+    """Определяем статус ABCP по masterStatus и subStatus Versta."""
+    key = (master_status, sub_status)
+    if key in VERSTA_TO_ABCP:
+        mapped = VERSTA_TO_ABCP[key]
+        log.debug(f"🔗 Маппинг статуса Versta {master_status}/{sub_status} → ABCP {mapped['name']} (ID {mapped['id']})")
+        return mapped
+    
+    # 🔒 Пока fallback не используется. В будущем можно включить:
+    # if (master_status, None) in FALLBACK_VERSTA_TO_ABCP:
+    #     mapped = FALLBACK_VERSTA_TO_ABCP[(master_status, None)]
+    #     log.debug(f"🔗 Fallback: Versta {master_status}/None → ABCP {mapped['name']} (ID {mapped['id']})")
+    #     return mapped
+
+    return None
+
+# VERSTA_TO_ABCP = {
+#     # === Новый заказ ===
+#     (0, None): {"id": 409381, "name": "Новый"},  # New - Новый заказ
+
+#     # === Ожидает оплаты (закомментировано, пока не используется) ===
+#     (10, None): {"id": 365188, "name": "Ожидает оплаты"},  # Waiting - Ожидание перед обработкой
+#     (20, None): {"id": 365188, "name": "Ожидает оплаты"},  # Approval - Подтверждение заказа
+#     (30, None): {"id": 365188, "name": "Ожидает оплаты"},  # Payment - Ожидание оплаты
+
+#     # === В работе ===
+#     (40, None): {"id": 365189, "name": "В работе"},  # Fulfilment - Комплектация
+#     (50, None): {"id": 365189, "name": "В работе"},  # TransferringToVendor - Передача заказа поставщику
+#     (60, None): {"id": 365189, "name": "В работе"},  # TransferredToVendor - Передан поставщику
+
+#     # === Доставляется ===
+#     (100, 6):  {"id": 405204, "name": "Доставляется"},  # CourierAssigned - Курьер назначен
+#     (100, 7):  {"id": 405204, "name": "Доставляется"},  # ParcelPickedUp - Груз забран
+#     (100, 8):  {"id": 405204, "name": "Доставляется"},  # CourierOnTheWay - Курьер в пути
+#     (100, 9):  {"id": 405204, "name": "Доставляется"},  # ParcelOnTheWay - Посылка в пути
+#     (100, 10): {"id": 405204, "name": "Доставляется"},  # ParcelInTheRecipientCity - Посылка в городе получателя
+#     (100, 11): {"id": 405204, "name": "Доставляется"},  # ParcelHandedForDelivery - Посылка передана на доставку
+#     (100, None): {"id": 405204, "name": "Доставляется"},  # Transportation - Доставка
+
+#     # === Доставлен ===
+#     (200, 12): {"id": 405205, "name": "Доставлен"},  # ParcelInPickupPoint - Посылка доставлена в ПВЗ
+#     (200, None): {"id": 405205, "name": "Доставлен"},  # Delivery - Вручение посылки
+
+#     # === Получен ===
+#     (700, 90): {"id": 385106, "name": "Получен"},  # Finished - Заказ выполнен
+#     (700, None): {"id": 385106, "name": "Получен"},  # Finished - Завершен с вручением
+
+#     # === Возвращается ===
+#     (800, 95): {"id": 385107, "name": "Возвращается"},  # RefuseOfDelivery - Отказ от вручения
+#     (800, None): {"id": 385107, "name": "Возвращается"},  # NotDelivered - Возврат (не вручено)
+#     (300, None): {"id": 385107, "name": "Возвращается"},  # Returning - возврат документов
+
+#     # === Проблема доставки ===
+#     (500, None): {"id": 409382, "name": "Проблема доставки"},  # ProblemDetected
+
+#     # === Отмены ===
+#     (600, None): {"id": 404714, "name": "Отменен по неоплате"},  # Cancelled
+#     ("Cancelled", None): {"id": 404714, "name": "Отменен по неоплате"},  # Cancelled (строковый)
+
+#     # === Вернулся в ТК ===
+#     (60, None): {"id": 418655, "name": "Вернулся в ТК"},  # NotDelivered
+#     ("NotDelivered", None): {"id": 418655, "name": "Вернулся в ТК"},  # NotDelivered (строковый)
+
+#     # === Возврат принят ===
+#     ("ReturnAccepted", None): {"id": 418656, "name": "Возврат принят"}  # ReturnAccepted
+# }
 
 # def get_date_range():
 #     today = datetime.today()
@@ -165,7 +220,40 @@ def extract_abcp_ids(orders):
     return {str(order.get("number")) for order in orders if order.get("number")}
 
 def build_versta_order_map(orders):
-    return {str(order.get("customerOrderId")): order for order in orders if order.get("customerOrderId")}
+    grouped = {}
+    for order in orders:
+        cust_id = str(order.get("customerOrderId"))
+        if not cust_id:
+            continue
+        grouped.setdefault(cust_id, []).append(order)
+
+    result = {}
+
+    for cust_id, group in grouped.items():
+        def get_date(o):
+            date_str = o.get("statusDate") or o.get("createDateTime")
+            if not date_str:
+                log.warning(f"⚠ Нет даты в заказе {o.get('orderId')}, исключён из выбора")
+                return datetime.min
+            try:
+                return parse(date_str)
+            except Exception:
+                log.warning(f"⚠ Некорректная дата: {date_str} (order: {o.get('orderId')})")
+                return datetime.min
+
+        excluded = [o for o in group if o.get("status") in EXCLUDED_STATUSES or o.get("masterStatus") in EXCLUDED_STATUSES]
+        if excluded:
+            log.info(f"ℹ Исключены заказы для customerOrderId={cust_id}: {[o.get('orderId') for o in excluded]}")
+
+        active = [o for o in group if o not in excluded]
+        relevant_orders = active if active else group
+        latest_order = max(relevant_orders, key=get_date)
+        result[cust_id] = latest_order
+
+        log.info(f"✅ Выбран заказ {latest_order.get('orderId')} для customerOrderId={cust_id} "
+                 f"со статусом '{latest_order.get('statusName')}' и датой {latest_order.get('statusDate') or latest_order.get('createDateTime')}")
+
+    return result
 
 def build_abcp_status_map(orders):
     return {
@@ -205,10 +293,7 @@ def find_orders_for_update(common_ids, abcp_statuses, versta_by_customer_id):
         except ValueError:
             log.warning(f"⚠ subStatus не является числом: {sub_status} (order {order_id})")
 
-        mapped_status = VERSTA_TO_ABCP.get((master_status, sub_status)) \
-            or VERSTA_TO_ABCP.get((master_status, None)) \
-            or VERSTA_TO_ABCP.get((versta_order.get("masterStatusName"), None))
-
+        mapped_status = map_status(master_status, sub_status)
         if not mapped_status:
             log.warning(f"⚠ Неизвестный статус: master={master_status}, sub={sub_status} для заказа {order_id}")
             continue
@@ -253,7 +338,9 @@ def update_abcp_order_positions(order, new_status_id):
             log.error(f"❌ Ошибка при обновлении позиции {pos_id}: {e}")
 
 # === Главная точка входа ===
-if __name__ == "__main__":
+if __name__ == "__main__":    
+    log_mapping_table()
+    
     while True:
         try:
             log.info(f"\n=== 🔄 Запуск проверки {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
